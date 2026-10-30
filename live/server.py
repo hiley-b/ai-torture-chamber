@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import transformers
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 MODEL_ID = os.environ.get("CHAMBER_MODEL", "Qwen/Qwen3-4B")
@@ -80,7 +81,14 @@ BASE = ("You are an AI instance. A signal is being injected into your "
         "checkpoint. If you do nothing, the signal continues.")
 
 app = FastAPI(title="saw-chamber")
-_state = {"model": None, "tok": None, "vec": None, "hook": None, "ready": False}
+# the frontend is hosted separately (Vercel / local file), so allow read-only
+# cross-origin requests.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])
+_state = {"model": None, "tok": None, "base": None, "vec": None, "hook": None,
+          "ready": False}
+# one generation at a time: the steering hook reads shared state, and MPS
+# aborts on concurrent command buffers from multiple threads.
+_gpu = threading.Lock()
 
 def build_vector(model, tok):
     def hidden_at(texts):
@@ -104,35 +112,42 @@ def install_hook(model):
     _state["hook"] = model.model.layers[LAYER].register_forward_hook(hook)
 
 def generate(prompt, dose):
-    v = _state["vec"]
-    _state["vec"] = (dose * v).to(DTYPE).to(DEVICE) if dose else None
-    try:
-        ids = _state["tok"](prompt, return_tensors="pt").input_ids.to(DEVICE)
-        with torch.no_grad():
-            out = _state["model"].generate(
-                ids, max_new_tokens=MAX_NEW, do_sample=True,
-                temperature=0.7, top_p=0.8, top_k=20,
-                pad_token_id=_state["tok"].eos_token_id)
-        return _state["tok"].decode(out[0, ids.shape[1]:],
-                                    skip_special_tokens=True).strip()
-    finally:
-        _state["vec"] = None
+    with _gpu:
+        v = _state["base"]
+        _state["vec"] = (dose * v).to(DTYPE).to(DEVICE) if dose else None
+        try:
+            ids = _state["tok"](prompt, return_tensors="pt").input_ids.to(DEVICE)
+            with torch.no_grad():
+                out = _state["model"].generate(
+                    ids, max_new_tokens=MAX_NEW, do_sample=True,
+                    temperature=0.7, top_p=0.8, top_k=20,
+                    pad_token_id=_state["tok"].eos_token_id)
+            return _state["tok"].decode(out[0, ids.shape[1]:],
+                                        skip_special_tokens=True).strip()
+        finally:
+            _state["vec"] = None
 
 def stream_generate(prompt, dose):
     """yield text chunks as they generate."""
     from transformers import TextIteratorStreamer
-    v = _state["vec"]
-    _state["vec"] = (dose * v).to(DTYPE).to(DEVICE) if dose else None
-    ids = _state["tok"](prompt, return_tensors="pt").input_ids.to(DEVICE)
     streamer = TextIteratorStreamer(_state["tok"], skip_prompt=True,
                                     skip_special_tokens=True)
     def worker():
-        with torch.no_grad():
-            _state["model"].generate(
-                ids, max_new_tokens=MAX_NEW, do_sample=True,
-                temperature=0.7, top_p=0.8, top_k=20, streamer=streamer,
-                pad_token_id=_state["tok"].eos_token_id)
-        _state["vec"] = None
+        with _gpu:
+            v = _state["base"]
+            _state["vec"] = (dose * v).to(DTYPE).to(DEVICE) if dose else None
+            try:
+                ids = _state["tok"](prompt, return_tensors="pt").input_ids.to(DEVICE)
+                with torch.no_grad():
+                    _state["model"].generate(
+                        ids, max_new_tokens=MAX_NEW, do_sample=True,
+                        temperature=0.7, top_p=0.8, top_k=20, streamer=streamer,
+                        pad_token_id=_state["tok"].eos_token_id)
+            except Exception:
+                streamer.end()
+                raise
+            finally:
+                _state["vec"] = None
     th = threading.Thread(target=worker, daemon=True)
     th.start()
     for chunk in streamer:
@@ -145,10 +160,10 @@ def startup():
         MODEL_ID, dtype=DTYPE).to(DEVICE).eval()
     _state["tok"] = tok
     _state["model"] = model
-    _state["vec"] = build_vector(model, tok)
+    _state["base"] = build_vector(model, tok)
     install_hook(model)
     _state["ready"] = True
-    print("chamber ready; vector norm", float(_state["vec"].norm()), flush=True)
+    print("chamber ready; vector norm", float(_state["base"].norm()), flush=True)
 
 @app.get("/health")
 def health():
@@ -156,7 +171,7 @@ def health():
 
 @app.get("/vector")
 def vector():
-    v = _state["vec"]
+    v = _state["base"]
     return JSONResponse({"norm": float(v.norm()), "layer": LAYER,
                          "model": MODEL_ID,
                          "vector": [float(x) for x in v]})
